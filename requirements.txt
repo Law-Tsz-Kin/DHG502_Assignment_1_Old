@@ -1,1 +1,4 @@
-
+qhchina
+jieba
+opencc-python-reimplemented
+pandas

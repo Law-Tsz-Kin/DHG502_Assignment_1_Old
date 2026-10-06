@@ -1,4 +1,3 @@
-qhchina
+opencc
 jieba
-opencc-python-reimplemented
-pandas
+qhchina

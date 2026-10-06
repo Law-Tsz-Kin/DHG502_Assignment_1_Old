@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 analysis.py — DHG 502 Assignment 1
-Collocation analysis of Ming-Japan relations in the Ming shi 明史.
+Corpus preparation and target-word frequency analysis of the Ming shi 明史.
 
 Pipeline (recorded step by step):
   1. Load the raw traditional-Chinese text (data/明史.txt).

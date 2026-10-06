@@ -47,7 +47,13 @@ Step 7  統計每卷:
           剔除標點、空白、腳註標記 [1] 等,供標準化之用);
         - 每千字「倭」字頻率 (wo_per_1000_chars)。
 
-Step 8  輸出 results/wo_frequency_by_juan.csv,並於終端機列印摘要。
+Step 8  輸出 results/wo_frequency_by_juan.csv(全 332 卷完整清單)。
+
+Step 9  輸出 results/wo_top10_juan.csv:「倭」字 Top 10 卷。
+        各卷長度差異大(約 2,000–12,000+ 字),故並列兩種排名:
+        - rank_by_count:依「倭」字原始出現次數(絕對篇幅);
+        - rank_by_freq :依每千字頻率(標準化,反映卷內相關密度)。
+        CSV 以次數排名為主軸,附上各卷的頻率排名欄位供對照。
 
 執行方式:  python3 analysis.py
 =====================================================================
@@ -65,6 +71,7 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_PATH = BASE_DIR / "data" / "明史.txt"
 OUTPUT_DIR = BASE_DIR / "results"
 OUTPUT_PATH = OUTPUT_DIR / "wo_frequency_by_juan.csv"
+OUTPUT_TOP10_PATH = OUTPUT_DIR / "wo_top10_juan.csv"   # Top 10 卷 CSV
 
 TARGET_CHAR = "倭"          # 分析目標字
 TOTAL_JUAN = 332            # 《明史》全書共 332 卷
@@ -216,13 +223,49 @@ def main() -> None:
         writer.writerows(rows)
     print(f"[Step 8] 已輸出 {OUTPUT_PATH.relative_to(BASE_DIR)}")
 
-    # 摘要:出現次數最多的前 15 卷
-    print("\n「倭」字出現次數最多的前 15 卷:")
-    print(f"{'卷號':>6}  {'次數':>4}  {'卷字數':>8}  {'每千字頻率':>10}")
-    top = sorted((r for r in rows if isinstance(r["wo_count"], int)),
-                 key=lambda r: r["wo_count"], reverse=True)[:15]
-    for r in top:
-        print(f"{r['juan_no']:>6}  {r['wo_count']:>4}  "
+    # Step 9:輸出 Top 10 卷 CSV
+    # 兩種排名並列:
+    #   rank_by_count       — 依「倭」字原始出現次數(反映絕對篇幅)
+    #   rank_by_freq        — 依每千字頻率(標準化,反映卷內相關密度)
+    # 各卷長度差異大(2,000–12,000+ 字),標準化頻率更適合跨卷比較。
+    with_content = [r for r in rows if r["has_content"]]
+    by_count = sorted(with_content,
+                      key=lambda r: r["wo_count"], reverse=True)[:10]
+    by_freq = sorted(with_content,
+                     key=lambda r: r["wo_per_1000_chars"], reverse=True)[:10]
+
+    with OUTPUT_TOP10_PATH.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "rank_by_count", "juan_no", "juan_title",
+            "wo_count", "han_chars", "wo_per_1000_chars",
+            "rank_by_freq",
+        ])
+        # 以「次數排名」為主軸,附上該卷的「頻率排名」供對照
+        freq_rank = {r["juan_no"]: i + 1
+                     for i, r in enumerate(by_freq)}
+        for i, r in enumerate(by_count):
+            writer.writerow([
+                i + 1, r["juan_no"], r["juan_title"],
+                r["wo_count"], r["han_chars"], r["wo_per_1000_chars"],
+                freq_rank.get(r["juan_no"], ""),
+            ])
+    print(f"[Step 9] 已輸出 {OUTPUT_TOP10_PATH.relative_to(BASE_DIR)}")
+
+    # 摘要:Top 10 卷(依次數)
+    print("\n「倭」字 Top 10 卷(依出現次數):")
+    print(f"{'排名':>4}  {'卷號':>6}  {'次數':>4}  {'卷字數':>8}  "
+          f"{'每千字頻率':>10}  {'頻率排名':>6}")
+    for i, r in enumerate(by_count):
+        print(f"{i + 1:>4}  {r['juan_no']:>6}  {r['wo_count']:>4}  "
+              f"{r['han_chars']:>8,}  {r['wo_per_1000_chars']:>10.4f}  "
+              f"{freq_rank.get(r['juan_no'], ''):>6}")
+
+    print("\n「倭」字 Top 10 卷(依每千字頻率):")
+    print(f"{'排名':>4}  {'卷號':>6}  {'次數':>4}  {'卷字數':>8}  "
+          f"{'每千字頻率':>10}")
+    for i, r in enumerate(by_freq):
+        print(f"{i + 1:>4}  {r['juan_no']:>6}  {r['wo_count']:>4}  "
               f"{r['han_chars']:>8,}  {r['wo_per_1000_chars']:>10.4f}")
 
 

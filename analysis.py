@@ -17,6 +17,7 @@ Pipeline (recorded step by step):
   7. Load data/userdict.txt into jieba (one word per line).
   8. Print 20 random segmented sentences containing a target word so
      the segmentation can be checked by eye.
+  9. Generate a target word frequency report.
 """
 
 import csv
@@ -231,16 +232,33 @@ def load_userdict():
 # Step 8 — random sample for eyeball check
 # --------------------------------------------------------------------------
 def sample_check(rows, n=20, seed=42):
-    targets = [w for w in TARGET_WORDS if len(w) >= 2] + ["倭"]
-    hits = [s for _, _, s in rows if any(t in s for t in targets)]
+    # Prefer sentences containing 倭-specific words (not generic titles)
+    core = [w for w in TARGET_WORDS if "倭" in w or w in
+            ("日本", "丰臣秀吉", "关白", "汪直", "王直", "戚继光", "朝鲜")]
+    hits = [s for _, _, s in rows if any(t in s for t in core)]
     rng = random.Random(seed)
     sample = rng.sample(hits, min(n, len(hits)))
-    print(f"\n[8] {len(hits):,} sentences contain a target word; "
+    print(f"\n[8] {len(hits):,} sentences contain a core target word; "
           f"showing {len(sample)} random samples (segmented):\n")
     for i, sent in enumerate(sample, 1):
         seg = " / ".join(jieba.cut(sent))
         print(f"{i:2d}. {seg}")
     return sample
+
+
+# --------------------------------------------------------------------------
+# Step 9 — target word frequency report
+# --------------------------------------------------------------------------
+def frequency_report(rows):
+    counts = {}
+    for _, _, s in rows:
+        for w in TARGET_WORDS:
+            if w in s:
+                counts[w] = counts.get(w, 0) + 1
+    print(f"\n[9] Target word frequency (sentences containing each word):")
+    for w, c in sorted(counts.items(), key=lambda x: -x[1])[:30]:
+        print(f"    {w}: {c:,}")
+    return counts
 
 
 # --------------------------------------------------------------------------
@@ -254,6 +272,7 @@ def main():
     write_userdict()                    # step 7a
     load_userdict()                     # step 7b
     sample_check(rows)                  # step 8
+    frequency_report(rows)              # step 9
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 AI Use Policy
 
-Tools Used: Copilot, GLM 5.3 Flash
+Tools Used:
+- Copilot
+- GLM 5.3 Flash
 
 Scope & Purpose of Use:
 - Use AI to assist with brainstorming, code explanations, debugging, summarization, and drafting project documentation.

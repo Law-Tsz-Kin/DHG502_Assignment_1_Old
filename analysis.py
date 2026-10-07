@@ -337,7 +337,7 @@ COLLOCATION_RUNS = [
     ("sentence", "sentence", None),
 ]
 KWIC_COLLOCATES = {
-    "Early Ming (1368-1523)": ("海上", "登岸", "出海"),
+    "Early Ming (1368-1523)": ("海上", "出海", "沿海"),
     "Middle Ming (1523-1567)": ("江北", "东南", "入寇"),
     "Late Ming (1592-1598)": ("朝鲜", "釜山", "蔚山"),
 }

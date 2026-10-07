@@ -18,9 +18,12 @@ Pipeline (recorded step by step):
   8. Print 20 random segmented sentences containing a target word so
      the segmentation can be checked by eye.
   9. Generate a target word frequency report.
- 10. Count target-word tokens by Ming-period phase.
+ 10. Count exact target-word tokens by Ming-period phase, omit terms with
+     zero counts in every phase, and write a phase/total frequency CSV.
  11. Find significant collocates for 倭 in three Ming-period phases and
      save window-5, window-10, and sentence results under output/.
+ 12. Build a standalone six-page HTML report from the output CSVs, including
+     sortable collocation/frequency tables and a cross-phase comparison tool.
 """
 
 import csv
@@ -661,7 +664,7 @@ def generate_results_html():
         f"{html.escape(label)}</a>"
         for page_id, label in nav_items
     )
-    title = "Collocation Analysis of Ming-Japan Relation Shift Throughout Different Periods of Ming Dynasty"
+    title = "Collocation Analysis of Ming-Japan Relation Shift throughout Different Periods of Ming Dynasty"
     cover = (
         '<section class="page cover" id="page-cover">'
         '<p class="eyebrow">DHG 502 · DIGITAL HISTORICAL RESEARCH</p>'

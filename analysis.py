@@ -24,6 +24,7 @@ Pipeline (recorded step by step):
      save window-5, window-10, and sentence results under output/.
  12. Build a standalone six-page HTML report from the output CSVs, including
      sortable collocation/frequency tables and a cross-phase comparison tool.
+ 13. Build a three-page KWIC report for the supplied phase-specific collocates.
 """
 
 import csv
@@ -37,7 +38,7 @@ import jieba
 import opencc
 import pandas as pd
 from qhchina import load_stopwords
-from qhchina.analytics.collocations import find_collocates
+from qhchina.analytics.collocations import find_collocates, kwic
 
 # --------------------------------------------------------------------------
 # Paths
@@ -50,6 +51,7 @@ INDEX_FILE = DATA_DIR / "index.csv"
 USERDICT_FILE = DATA_DIR / "userdict.txt"
 OUTPUT_DIR = ROOT / "output"
 RESULTS_HTML_FILE = OUTPUT_DIR / "results.html"
+KWIC_HTML_FILE = OUTPUT_DIR / "kwic.html"
 
 # --------------------------------------------------------------------------
 # Step 0 — target words (simplified forms) for the user dictionary
@@ -334,6 +336,11 @@ COLLOCATION_RUNS = [
     ("window_h10", "window", 10),
     ("sentence", "sentence", None),
 ]
+KWIC_COLLOCATES = {
+    "Early Ming (1368-1523)": ("海上", "登岸", "出海"),
+    "Middle Ming (1523-1567)": ("江北", "东南", "入寇"),
+    "Late Ming (1592-1598)": ("朝鲜", "釜山", "蔚山"),
+}
 
 
 def extract_dated_sentences(rows):
@@ -427,6 +434,280 @@ def run_collocation_analysis(rows):
         print(f"\n[10] Wrote collocates -> {output_file.relative_to(ROOT)}")
 
 
+def load_corpus_index():
+    """Return line-to-volume metadata when the optional corpus index exists."""
+    if not INDEX_FILE.exists():
+        return None
+
+    with INDEX_FILE.open(encoding="utf-8-sig", newline="") as csv_file:
+        return {
+            int(record["line"]): {
+                "juan": record["juan"],
+                "title": record["title"],
+            }
+            for record in csv.DictReader(csv_file)
+        }
+
+
+def generate_kwic_html(rows):
+    """Write KWIC passages for each phase collocate and context horizon."""
+    phase_entries = {phase_name: [] for phase_name, _, _ in MING_PHASES}
+    for line_number, (year, sentence) in enumerate(
+        extract_dated_sentences(rows), start=1
+    ):
+        if year is None:
+            continue
+        for phase_name, start_year, end_year in MING_PHASES:
+            if start_year <= year <= end_year:
+                phase_entries[phase_name].append((line_number, sentence))
+
+    index = load_corpus_index()
+    horizons = (("5", 5), ("10", 10), ("Sentence", None))
+    horizon_titles = {
+        "5": "5-Word Analysis",
+        "10": "10-Word Analysis",
+        "Sentence": "Sentence Analysis",
+    }
+    stats_by_run = {}
+    for run_name, _, _ in COLLOCATION_RUNS:
+        stats_path = OUTPUT_DIR / f"collocates_{run_name}.csv"
+        with stats_path.open(encoding="utf-8-sig", newline="") as csv_file:
+            stats_by_run[run_name] = {
+                (record["phase"], record["collocate"]): record
+                for record in csv.DictReader(csv_file)
+            }
+
+    statistic_fields = (
+        ("obs_local", "Observed"),
+        ("exp_local", "Expected"),
+        ("ratio_local", "Observed / expected"),
+        ("log_likelihood", "Log-likelihood"),
+        ("log_dice", "logDice"),
+        ("p_value", "p-value"),
+        ("adjusted_p_value", "Adjusted p-value"),
+    )
+    run_by_horizon = {
+        "5": "window_h5",
+        "10": "window_h10",
+        "Sentence": "sentence",
+    }
+    phase_results = {}
+
+    for phase_name, _, _ in MING_PHASES:
+        entries = phase_entries[phase_name]
+        tokenized = [jieba.lcut(sentence, HMM=False) for _, sentence in entries]
+        sentence_horizon = max((len(sentence) for sentence in tokenized), default=1)
+        results_by_horizon = {}
+
+        for horizon_name, horizon_size in horizons:
+            concordance = kwic(
+                sentences=tokenized,
+                target="倭",
+                horizon=horizon_size or sentence_horizon,
+                sort_by="position",
+                separator="",
+                return_type="dataframe",
+                max_sentence_length=None,
+            )
+            if not isinstance(concordance, pd.DataFrame):
+                raise TypeError("kwic did not return a pandas DataFrame")
+            concordance_records = concordance.to_dict(orient="records")
+            matches_by_collocate = {}
+            for collocate in KWIC_COLLOCATES[phase_name]:
+                matches = []
+                for record in concordance_records:
+                    left = record["left"]
+                    right = record["right"]
+                    if collocate not in left and collocate not in right:
+                        continue
+
+                    source_line = entries[record["doc_index"]][0]
+                    metadata = index[source_line] if index is not None else None
+                    stats = stats_by_run[run_by_horizon[horizon_name]].get(
+                        (phase_name, collocate)
+                    )
+                    matches.append({
+                        "left": left,
+                        "node": record["node"],
+                        "right": right,
+                        "juan": metadata["juan"] if metadata else "",
+                        "title": metadata["title"] if metadata else "",
+                        "stats": stats,
+                    })
+                    if len(matches) == 10:
+                        break
+                matches_by_collocate[collocate] = matches
+            results_by_horizon[horizon_name] = matches_by_collocate
+
+        phase_results[phase_name] = results_by_horizon
+
+    def context_html(context, collocate):
+        pieces = re.split(f"({re.escape(collocate)})", context)
+        return "".join(
+            f"<mark>{html.escape(piece)}</mark>"
+            if piece == collocate
+            else html.escape(piece)
+            for piece in pieces
+        )
+
+    phase_pages = []
+    for phase_name, _, _ in MING_PHASES:
+        collocate_sections = []
+        for collocate in KWIC_COLLOCATES[phase_name]:
+            horizon_sections = []
+            for horizon_name, _ in horizons:
+                passages = phase_results[phase_name][horizon_name][collocate]
+                if passages:
+                    passage_items = []
+                    for passage in passages:
+                        source = ""
+                        if index is not None:
+                            source = (
+                                '<span class="source">'
+                                f"卷 {html.escape(passage['juan'])} · "
+                                f"{html.escape(passage['title'])}</span>"
+                            )
+                        if passage["stats"] is None:
+                            stats_html = (
+                                '<span class="stats-unavailable">'
+                                "Statistics unavailable: collocate is not in this "
+                                "method’s significant top-20 results.</span>"
+                            )
+                        else:
+                            stat_items = []
+                            for field, label in statistic_fields:
+                                raw_value = passage["stats"].get(field, "")
+                                try:
+                                    number = float(raw_value)
+                                    value = (
+                                        f"{number:.3g}"
+                                        if field in {"p_value", "adjusted_p_value"}
+                                        else f"{number:,.4g}"
+                                    )
+                                except (TypeError, ValueError):
+                                    value = raw_value or "—"
+                                stat_items.append(
+                                    f'<span><strong>{html.escape(label)}:</strong> '
+                                    f"{html.escape(value)}</span>"
+                                )
+                            stats_html = (
+                                f'<span class="passage-stats">'
+                                f"{''.join(stat_items)}</span>"
+                            )
+                        passage_items.append(
+                            '<li class="passage">'
+                            f"{context_html(passage['left'], collocate)}"
+                            f'<mark class="node">{html.escape(passage["node"])}</mark>'
+                            f"{context_html(passage['right'], collocate)}"
+                            f"{stats_html}"
+                            f"{source}</li>"
+                        )
+                    passage_content = f"<ol>{''.join(passage_items)}</ol>"
+                else:
+                    passage_content = '<p class="empty">No passages found.</p>'
+                horizon_sections.append(
+                    '<section class="horizon">'
+                    f"<h4>{horizon_titles[horizon_name]}</h4>"
+                    f"{passage_content}</section>"
+                )
+            collocate_sections.append(
+                '<section class="collocate">'
+                f"<h3>{html.escape(collocate)}</h3>"
+                f"{''.join(horizon_sections)}</section>"
+            )
+        phase_id = phase_name.split()[0].lower() + "-ming"
+        phase_pages.append(
+            f'<section class="page" id="page-{phase_id}" hidden>'
+            f"<h2>{html.escape(phase_name)}</h2>"
+            '<p class="intro">Up to 10 concordance passages per collocate and '
+            "context horizon. The target 倭 is bold; the requested collocate "
+            "is highlighted.</p>"
+            f"{''.join(collocate_sections)}</section>"
+        )
+
+    title = (
+        "KWIC: Collocation Analysis of Ming-Japan Relation Shift "
+        "throughout Different Periods of Ming Dynasty"
+    )
+    navigation = "".join(
+        f'<a class="nav-link" href="#{phase_name.split()[0].lower()}-ming" '
+        f'data-page="{phase_name.split()[0].lower()}-ming">'
+        f"{phase_name.split()[0]} Ming</a>"
+        for phase_name, _, _ in MING_PHASES
+    )
+    navigation = (
+        '<a class="nav-link" href="#cover" data-page="cover">Cover</a>'
+        + navigation
+    )
+    html_document = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+:root {{ color-scheme: light; --ink: #172c3b; --muted: #617381; --accent: #246b75; --paper: #f4f7f6; --line: #dce5e3; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+.topbar {{ position: fixed; inset: 0 0 auto; z-index: 10; display: flex; gap: .5rem; overflow-x: auto; padding: .8rem max(1rem, calc((100vw - 1100px) / 2)); background: #142b39; box-shadow: 0 3px 12px #142b3940; }}
+.nav-link {{ flex: 0 0 auto; padding: .55rem .8rem; border: 1px solid #516673; border-radius: .45rem; color: #f4f8f7; text-decoration: none; }}
+.nav-link:hover, .nav-link[aria-current="page"] {{ background: var(--accent); border-color: #76b4b3; }}
+main {{ max-width: 1100px; margin: auto; padding: 5.5rem 1rem 4rem; }}
+.page[hidden] {{ display: none; }}
+.cover {{ min-height: 72vh; display: flex; flex-direction: column; justify-content: center; padding: clamp(1rem, 6vw, 5rem); border: 1px solid var(--line); border-radius: 1rem; background: linear-gradient(145deg, #fff, #e7f0ed); }}
+.cover h1 {{ max-width: 850px; font: 700 clamp(2.2rem, 6vw, 4.4rem)/1.15 Georgia, "Times New Roman", serif; }}
+.eyebrow {{ color: var(--accent); font-size: .8rem; font-weight: 750; letter-spacing: .12em; }}
+.intro, .source {{ color: var(--muted); }}
+.collocate {{ margin: 2rem 0; padding: 1rem 1.25rem; border: 1px solid var(--line); border-radius: .7rem; background: white; }}
+.horizon {{ margin: 1.3rem 0; }}
+.passage {{ margin: .55rem 0; padding: .7rem; border-bottom: 1px solid var(--line); }}
+.source {{ display: block; margin-top: .25rem; font-size: .85rem; }}
+.passage-stats {{ display: flex; flex-wrap: wrap; gap: .25rem .85rem; margin-top: .4rem; color: #344f5d; font-size: .82rem; }}
+.stats-unavailable {{ display: block; margin-top: .4rem; color: var(--muted); font-size: .82rem; font-style: italic; }}
+mark {{ border-radius: .2rem; background: #fff0b5; color: inherit; }}
+mark.node {{ background: #b9e4dc; font-weight: 800; }}
+.empty {{ color: var(--muted); font-style: italic; }}
+@media (max-width: 700px) {{ main {{ padding: 5rem .65rem 3rem; }} .topbar {{ padding: .6rem; }} .collocate {{ padding: .7rem; }} }}
+</style>
+</head>
+<body>
+<nav class="topbar" aria-label="Ming period pages">{navigation}</nav>
+<main>
+<section class="page cover" id="page-cover">
+<p class="eyebrow">KEYWORD IN CONTEXT · 明史</p>
+<h1>{html.escape(title)}</h1>
+<p>Concordance passages for 倭 and the supplied collocates in the Early, Middle, and Late Ming phases.</p>
+<p class="intro">Use the navigation bar to open a period. Each collocate is shown with 5-Word Analysis, 10-Word Analysis, and Sentence Analysis contexts.</p>
+</section>
+{''.join(phase_pages)}
+</main>
+<script>
+(() => {{
+  const links = [...document.querySelectorAll('.nav-link')];
+  const pages = [...document.querySelectorAll('.page')];
+  function showPage() {{
+    const requested = location.hash.slice(1) || 'cover';
+    const pageId = document.getElementById('page-' + requested) ? requested : 'cover';
+    for (const page of pages) page.hidden = page.id !== 'page-' + pageId;
+    for (const link of links) {{
+      if (link.dataset.page === pageId) link.setAttribute('aria-current', 'page');
+      else link.removeAttribute('aria-current');
+    }}
+    window.scrollTo(0, 0);
+  }}
+  window.addEventListener('hashchange', showPage);
+  showPage();
+}})();
+</script>
+</body>
+</html>
+"""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    KWIC_HTML_FILE.write_text(html_document, encoding="utf-8")
+    print(f"[13] Wrote KWIC report -> {KWIC_HTML_FILE.relative_to(ROOT)}")
+    return KWIC_HTML_FILE
+
+
 def run_target_word_frequencies(rows):
     """Count exact target tokens by phase and omit terms absent from all phases."""
     phase_counts = {
@@ -505,13 +786,13 @@ def generate_results_html():
     collocation_runs = [
         (
             "window-h5",
-            "Page 2 · 5 Words Collocation Analysis",
+            "Page 2 · 5-Word Collocation Analysis",
             "collocates_window_h5.csv",
             "Window method, horizon = 5",
         ),
         (
             "window-h10",
-            "Page 3 · 10 Words Collocation Analysis",
+            "Page 3 · 10-Word Collocation Analysis",
             "collocates_window_h10.csv",
             "Window method, horizon = 10",
         ),
@@ -524,8 +805,8 @@ def generate_results_html():
     ]
     phases = [phase_name for phase_name, _, _ in MING_PHASES]
     comparison_methods = [
-        ("window_h5", "5 Words", "collocates_window_h5.csv"),
-        ("window_h10", "10 Words", "collocates_window_h10.csv"),
+        ("window_h5", "5-Word", "collocates_window_h5.csv"),
+        ("window_h10", "10-Word", "collocates_window_h10.csv"),
         ("sentence", "Sentence", "collocates_sentence.csv"),
     ]
     collocation_columns = [
@@ -617,8 +898,8 @@ def generate_results_html():
     comparison_controls = (
         '<div class="comparison-controls">'
         '<label>Method <select id="comparison-method">'
-        '<option value="window_h5">5 Words</option>'
-        '<option value="window_h10">10 Words</option>'
+        '<option value="window_h5">5-Word</option>'
+        '<option value="window_h10">10-Word</option>'
         '<option value="sentence">Sentence</option>'
         '</select></label>'
         '<label>Statistic <select id="comparison-stat">'
@@ -640,7 +921,7 @@ def generate_results_html():
         '<section class="page" id="page-compare" hidden>'
         "<h2>Page 6 · Interactive Comparison</h2>"
         '<p class="method-note">Compare the three Ming phases side by side. '
-        "Choose 5 Words, 10 Words, or Sentence to compare a method across phases, "
+        "Choose 5-Word, 10-Word, or Sentence to compare a method across phases, "
         "select a statistic, and optionally search for a collocate. Click a column "
         "heading to sort. A dash means the collocate is not present in the selected "
         "method’s significant top-20 results for that phase; it is not a measured zero.</p>"
@@ -653,8 +934,8 @@ def generate_results_html():
 
     nav_items = [
         ("cover", "Cover · Page 1"),
-        ("window-h5", "5 Words · Page 2"),
-        ("window-h10", "10 Words · Page 3"),
+        ("window-h5", "5-Word · Page 2"),
+        ("window-h10", "10-Word · Page 3"),
         ("sentence", "Sentence · Page 4"),
         ("frequency", "Word Frequency · Page 5"),
         ("compare", "Compare · Page 6"),
@@ -873,6 +1154,7 @@ def main():
     run_target_word_frequencies(rows)   # step 10
     run_collocation_analysis(rows)      # step 11
     generate_results_html()             # step 12
+    generate_kwic_html(rows)            # step 13
 
 
 if __name__ == "__main__":

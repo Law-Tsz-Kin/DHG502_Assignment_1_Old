@@ -24,7 +24,8 @@ Pipeline (recorded step by step):
      save window-5, window-10, and sentence results under output/.
  12. Build a standalone six-page HTML report from the output CSVs, including
      sortable collocation/frequency tables and a cross-phase comparison tool.
- 13. Build a three-page KWIC report for the supplied phase-specific collocates.
+ 13. Export KWIC passages for the supplied phase-specific collocates to CSV.
+ 14. Build a three-page KWIC report for the supplied phase-specific collocates.
 """
 
 import csv
@@ -52,6 +53,7 @@ USERDICT_FILE = DATA_DIR / "userdict.txt"
 OUTPUT_DIR = ROOT / "output"
 RESULTS_HTML_FILE = OUTPUT_DIR / "results.html"
 KWIC_HTML_FILE = OUTPUT_DIR / "kwic.html"
+KWIC_CSV_FILE = OUTPUT_DIR / "kwic.csv"
 
 # --------------------------------------------------------------------------
 # Step 0 — target words (simplified forms) for the user dictionary
@@ -314,6 +316,9 @@ MING_ERA_STARTS = {
     "嘉靖": 1522,
     "隆庆": 1567,
     "万历": 1573,
+    "泰昌": 1620,
+    "天启": 1621,
+    "崇祯": 1628,
 }
 ERA_PATTERN = "|".join(sorted(MING_ERA_STARTS, key=len, reverse=True))
 DATE_RE = re.compile(
@@ -326,9 +331,9 @@ BARE_DATE_SUFFIX_RE = re.compile(
 )
 
 MING_PHASES = [
-    ("Early Ming (1368-1523)", 1368, 1523),
+    ("Early Ming (1368-1522)", 1368, 1522),
     ("Middle Ming (1523-1567)", 1523, 1567),
-    ("Late Ming (1592-1598)", 1592, 1598),
+    ("Late Ming (1568-1644)", 1568, 1644),
 ]
 
 COLLOCATION_RUNS = [
@@ -337,9 +342,9 @@ COLLOCATION_RUNS = [
     ("sentence", "sentence", None),
 ]
 KWIC_COLLOCATES = {
-    "Early Ming (1368-1523)": ("海上", "出海", "沿海"),
-    "Middle Ming (1523-1567)": ("江北", "东南", "入寇"),
-    "Late Ming (1592-1598)": ("朝鲜", "釜山", "蔚山"),
+    "Early Ming (1368-1522)": ("海上", "出海", "沿海"),
+    "Middle Ming (1523-1567)": ("江北", "东南", "官军"),
+    "Late Ming (1568-1644)": ("朝鲜", "釜山", "平壤"),
 }
 
 
@@ -373,15 +378,27 @@ def extract_dated_sentences(rows):
     return dated_rows
 
 
+def phase_for_year(year):
+    """Return the Ming phase containing a year, or None if it is out of range."""
+    return next(
+        (
+            phase_name
+            for phase_name, start_year, end_year in MING_PHASES
+            if start_year <= year <= end_year
+        ),
+        None,
+    )
+
+
 def run_collocation_analysis(rows):
     """Run the three collocation configurations and save their CSVs."""
     phase_sentences = {name: [] for name, _, _ in MING_PHASES}
     for year, sentence in extract_dated_sentences(rows):
         if year is None:
             continue
-        for phase_name, start_year, end_year in MING_PHASES:
-            if start_year <= year <= end_year:
-                phase_sentences[phase_name].append(sentence)
+        phase_name = phase_for_year(year)
+        if phase_name is not None:
+            phase_sentences[phase_name].append(sentence)
 
     stopwords = sorted(load_stopwords("zh_cl_sim"))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -457,9 +474,9 @@ def generate_kwic_html(rows):
     ):
         if year is None:
             continue
-        for phase_name, start_year, end_year in MING_PHASES:
-            if start_year <= year <= end_year:
-                phase_entries[phase_name].append((line_number, sentence))
+        phase_name = phase_for_year(year)
+        if phase_name is not None:
+            phase_entries[phase_name].append((line_number, year, sentence))
 
     index = load_corpus_index()
     horizons = (("5", 5), ("10", 10), ("Sentence", None))
@@ -495,7 +512,7 @@ def generate_kwic_html(rows):
 
     for phase_name, _, _ in MING_PHASES:
         entries = phase_entries[phase_name]
-        tokenized = [jieba.lcut(sentence, HMM=False) for _, sentence in entries]
+        tokenized = [jieba.lcut(sentence, HMM=False) for _, _, sentence in entries]
         sentence_horizon = max((len(sentence) for sentence in tokenized), default=1)
         results_by_horizon = {}
 
@@ -521,12 +538,17 @@ def generate_kwic_html(rows):
                     if collocate not in left and collocate not in right:
                         continue
 
-                    source_line = entries[record["doc_index"]][0]
+                    source_line, year, _ = entries[record["doc_index"]]
                     metadata = index[source_line] if index is not None else None
                     stats = stats_by_run[run_by_horizon[horizon_name]].get(
                         (phase_name, collocate)
                     )
                     matches.append({
+                        "phase": phase_name,
+                        "year": year,
+                        "line": source_line,
+                        "horizon": horizon_name,
+                        "collocate": collocate,
                         "left": left,
                         "node": record["node"],
                         "right": right,
@@ -540,6 +562,51 @@ def generate_kwic_html(rows):
             results_by_horizon[horizon_name] = matches_by_collocate
 
         phase_results[phase_name] = results_by_horizon
+
+    kwic_fields = [
+        "phase", "year", "method", "horizon", "collocate", "match_number",
+        "corpus_line", "juan", "title", "left", "node", "right", "context",
+        "target", "exp_local", "obs_local", "ratio_local", "obs_global",
+        "p_value", "log_likelihood", "log_dice", "adjusted_p_value",
+    ]
+    with KWIC_CSV_FILE.open("w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=kwic_fields)
+        writer.writeheader()
+        for phase_name, _, _ in MING_PHASES:
+            for horizon_name, _ in horizons:
+                for collocate in KWIC_COLLOCATES[phase_name]:
+                    passages = phase_results[phase_name][horizon_name][collocate]
+                    for match_number, passage in enumerate(passages, start=1):
+                        stats = passage["stats"] or {}
+                        writer.writerow({
+                            "phase": phase_name,
+                            "year": passage["year"],
+                            "method": run_by_horizon[horizon_name],
+                            "horizon": horizon_name,
+                            "collocate": collocate,
+                            "match_number": match_number,
+                            "corpus_line": passage["line"],
+                            "juan": passage["juan"],
+                            "title": passage["title"],
+                            "left": passage["left"],
+                            "node": passage["node"],
+                            "right": passage["right"],
+                            "context": (
+                                passage["left"] + passage["node"] + passage["right"]
+                            ),
+                            "target": "倭",
+                            **{
+                                field: stats.get(field, "")
+                                for field in kwic_fields
+                                if field in {
+                                    "exp_local", "obs_local", "ratio_local",
+                                    "obs_global", "p_value",
+                                    "log_likelihood", "log_dice",
+                                    "adjusted_p_value",
+                                }
+                            },
+                        })
+    print(f"[13] Wrote KWIC CSV -> {KWIC_CSV_FILE.relative_to(ROOT)}")
 
     def context_html(context, collocate):
         pieces = re.split(f"({re.escape(collocate)})", context)
@@ -704,7 +771,7 @@ mark.node {{ background: #b9e4dc; font-weight: 800; }}
 """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     KWIC_HTML_FILE.write_text(html_document, encoding="utf-8")
-    print(f"[13] Wrote KWIC report -> {KWIC_HTML_FILE.relative_to(ROOT)}")
+    print(f"[14] Wrote KWIC report -> {KWIC_HTML_FILE.relative_to(ROOT)}")
     return KWIC_HTML_FILE
 
 
@@ -718,11 +785,11 @@ def run_target_word_frequencies(rows):
     for year, sentence in extract_dated_sentences(rows):
         if year is None:
             continue
-        for phase_name, start_year, end_year in MING_PHASES:
-            if start_year <= year <= end_year:
-                for token in jieba.lcut(sentence, HMM=False):
-                    if token in phase_counts[phase_name]:
-                        phase_counts[phase_name][token] += 1
+        phase_name = phase_for_year(year)
+        if phase_name is not None:
+            for token in jieba.lcut(sentence, HMM=False):
+                if token in phase_counts[phase_name]:
+                    phase_counts[phase_name][token] += 1
 
     table = pd.DataFrame.from_dict(phase_counts, orient="index").transpose()
     table.index.name = "word"
@@ -952,8 +1019,8 @@ def generate_results_html():
         f"<h1>{html.escape(title)}</h1>"
         '<p class="cover-copy">Collocates of 倭 and related target-word frequencies '
         "across three Ming-period phases.</p>"
-        '<p class="cover-phases">Early Ming (1368–1523) · Middle Ming (1523–1567) · '
-        "Late Ming (1592–1598)</p>"
+        '<p class="cover-phases">Early Ming (1368–1522) · Middle Ming (1523–1567) · '
+        "Late Ming (1568–1644)</p>"
         '<p class="cover-hint">Use the navigation bar above to open each analysis page.</p>'
         "</section>"
     )
@@ -1154,7 +1221,7 @@ def main():
     run_target_word_frequencies(rows)   # step 10
     run_collocation_analysis(rows)      # step 11
     generate_results_html()             # step 12
-    generate_kwic_html(rows)            # step 13
+    generate_kwic_html(rows)            # steps 13-14
 
 
 if __name__ == "__main__":

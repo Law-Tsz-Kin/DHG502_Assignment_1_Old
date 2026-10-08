@@ -21,7 +21,8 @@ Pipeline (recorded step by step):
  10. Count exact target-word tokens by Ming-period phase, omit terms with
      zero counts in every phase, and write a phase/total frequency CSV.
  11. Find significant collocates for 倭 in three Ming-period phases and
-     save window-5, window-10, and sentence results under output/.
+     save window-5, window-10, and sentence results under output/, with
+     Fisher exact p-values recomputed in log space to avoid underflow.
  12. Build a standalone six-page HTML report from the output CSVs, including
      sortable collocation/frequency tables and a cross-phase comparison tool.
  13. Export KWIC passages for the supplied phase-specific collocates to CSV.
@@ -31,13 +32,18 @@ Pipeline (recorded step by step):
 import csv
 import html
 import json
+import math
 import random
 import re
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import jieba
+import numpy as np
 import opencc
 import pandas as pd
+from scipy.special import logsumexp
+from scipy.stats import hypergeom
 from qhchina import load_stopwords
 from qhchina.analytics.collocations import find_collocates, kwic
 
@@ -390,6 +396,183 @@ def phase_for_year(year):
     )
 
 
+def _contingency_counts(tokenized, method, horizon):
+    """Build the same 2x2 tables used by qhchina for the selected method."""
+    sentences = [sentence[:256] for sentence in tokenized]
+    target = "倭"
+
+    if method == "sentence":
+        target_margin = 0
+        candidate_margins = {}
+        joint_counts = {}
+        for sentence in sentences:
+            unique_tokens = set(sentence)
+            for token in unique_tokens:
+                candidate_margins[token] = candidate_margins.get(token, 0) + 1
+            if target in unique_tokens:
+                target_margin += 1
+                for token in unique_tokens:
+                    joint_counts[token] = joint_counts.get(token, 0) + 1
+
+        total = len(sentences)
+        sample_size = total
+    elif method == "window":
+        total_tokens = sum(len(sentence) for sentence in sentences)
+        target_frequency = sum(
+            token == target for sentence in sentences for token in sentence
+        )
+        candidate_margins = {}
+        joint_counts = {}
+        target_margin = 0
+
+        for sentence in sentences:
+            for token in sentence:
+                candidate_margins[token] = candidate_margins.get(token, 0) + 1
+            target_positions = [
+                index for index, token in enumerate(sentence) if token == target
+            ]
+            context_positions = {
+                index
+                for target_position in target_positions
+                for index in range(
+                    max(0, target_position - horizon),
+                    min(len(sentence), target_position + horizon + 1),
+                )
+                if index != target_position and sentence[index] != target
+            }
+            target_margin += len(context_positions)
+            for index in context_positions:
+                token = sentence[index]
+                joint_counts[token] = joint_counts.get(token, 0) + 1
+
+        sample_size = total_tokens - target_frequency
+    else:
+        raise ValueError(f"Unknown collocation method: {method}")
+
+    tables = {}
+    for collocate, observed in joint_counts.items():
+        if collocate == target:
+            continue
+        row_without_collocate = target_margin - observed
+        collocate_without_target = candidate_margins[collocate] - observed
+        neither = (
+            sample_size
+            - observed
+            - row_without_collocate
+            - collocate_without_target
+        )
+        tables[collocate] = (
+            observed,
+            row_without_collocate,
+            collocate_without_target,
+            neither,
+        )
+    return tables
+
+
+def _fisher_log_p_value(table):
+    """Return log(P[X >= observed]) without underflowing small Fisher tails."""
+    observed = table[0]
+    population = sum(table)
+    target_margin = table[0] + table[1]
+    collocate_margin = table[0] + table[2]
+    log_p_value = float(
+        hypergeom.logsf(
+            observed - 1,
+            population,
+            collocate_margin,
+            target_margin,
+        )
+    )
+    if math.isnan(log_p_value):
+        upper = min(target_margin, collocate_margin)
+        log_p_value = float(
+            logsumexp(
+                hypergeom.logpmf(
+                    np.arange(observed, upper + 1),
+                    population,
+                    collocate_margin,
+                    target_margin,
+                )
+            )
+        )
+    if not math.isfinite(log_p_value):
+        raise ArithmeticError(f"Could not compute Fisher p-value for table {table}")
+    return min(log_p_value, 0.0)
+
+
+def _fisher_decimal_p_value(table, precision=50):
+    """Calculate the Fisher upper tail as a high-precision decimal."""
+    observed = table[0]
+    population = sum(table)
+    target_margin = table[0] + table[1]
+    collocate_margin = table[0] + table[2]
+    upper = min(target_margin, collocate_margin)
+
+    with localcontext() as context:
+        context.prec = precision
+        numerator = (
+            Decimal(math.comb(collocate_margin, observed))
+            * Decimal(
+                math.comb(
+                    population - collocate_margin,
+                    target_margin - observed,
+                )
+            )
+        )
+        denominator = Decimal(math.comb(population, target_margin))
+        term = numerator / denominator
+        tail = term
+        for value in range(observed, upper):
+            term *= (
+                Decimal(collocate_margin - value)
+                * Decimal(target_margin - value)
+                / (
+                    Decimal(value + 1)
+                    * Decimal(
+                        population
+                        - collocate_margin
+                        - target_margin
+                        + value
+                        + 1
+                    )
+                )
+            )
+            tail += term
+        return +tail
+
+
+def _benjamini_hochberg_log10(log10_p_values):
+    """Apply BH correction in log10 space to preserve very small p-values."""
+    if not log10_p_values:
+        return []
+    order = sorted(range(len(log10_p_values)), key=log10_p_values.__getitem__)
+    count = len(order)
+    adjusted = [0.0] * count
+    next_value = 0.0
+    for rank_index in range(count - 1, -1, -1):
+        original_index = order[rank_index]
+        candidate = min(
+            0.0,
+            log10_p_values[original_index]
+            + math.log10(count)
+            - math.log10(rank_index + 1),
+        )
+        next_value = min(candidate, next_value) if rank_index < count - 1 else candidate
+        adjusted[original_index] = next_value
+    return adjusted
+
+
+def _format_probability(log10_probability):
+    """Expand a log10 probability to a 50-significant-digit decimal string."""
+    if log10_probability >= 0:
+        return "1"
+    with localcontext() as context:
+        context.prec = 50
+        probability = Decimal(10) ** Decimal(str(log10_probability))
+        return format(probability, "f")
+
+
 def run_collocation_analysis(rows):
     """Run the three collocation configurations and save their CSVs."""
     phase_sentences = {name: [] for name, _, _ in MING_PHASES}
@@ -431,9 +614,50 @@ def run_collocation_analysis(rows):
                 target_words="倭",
                 **kwargs,
             )
+            contingency_tables = _contingency_counts(tokenized, method, horizon)
+            log_p_values = [
+                _fisher_log_p_value(
+                    contingency_tables[row["collocate"]]
+                ) / math.log(10)
+                for _, row in results.iterrows()
+            ]
+            log_adjusted_p_values = _benjamini_hochberg_log10(log_p_values)
+            results["log10_p_value"] = log_p_values
+            results["log10_adjusted_p_value"] = log_adjusted_p_values
+            results["p_value"] = [
+                math.exp(log_value * math.log(10))
+                if log_value > math.log10(float.fromhex("0x0.0000000000001p-1022"))
+                else 0.0
+                for log_value in log_p_values
+            ]
+            results["adjusted_p_value"] = [
+                math.exp(log_value * math.log(10))
+                if log_value > math.log10(float.fromhex("0x0.0000000000001p-1022"))
+                else 0.0
+                for log_value in log_adjusted_p_values
+            ]
             significant = results.loc[
-                results["adjusted_p_value"] < 0.05
+                results["log10_adjusted_p_value"] < math.log10(0.05)
             ].sort_values("log_dice", ascending=False).head(20).copy()
+            for cell_index, cell_name in enumerate((
+                "a_target_and_collocate",
+                "b_target_without_collocate",
+                "c_collocate_without_target",
+                "d_neither",
+            )):
+                significant[cell_name] = [
+                    contingency_tables[row["collocate"]][cell_index]
+                    for _, row in significant.iterrows()
+                ]
+            significant["p_value"] = [
+                format(
+                    _fisher_decimal_p_value(
+                        contingency_tables[row["collocate"]]
+                    ),
+                    "f",
+                )
+                for _, row in significant.iterrows()
+            ]
             significant.insert(0, "phase", phase_name)
             outputs[run_name].append(significant)
 
@@ -445,9 +669,11 @@ def run_collocation_analysis(rows):
 
     for run_name, _, _ in COLLOCATION_RUNS:
         output_file = OUTPUT_DIR / f"collocates_{run_name}.csv"
-        pd.concat(outputs[run_name], ignore_index=True).to_csv(
-            output_file, index=False, encoding="utf-8"
+        export = pd.concat(outputs[run_name], ignore_index=True)
+        export["adjusted_p_value"] = export["log10_adjusted_p_value"].map(
+            lambda value: _format_probability(float(value))
         )
+        export.to_csv(output_file, index=False, encoding="utf-8")
         print(f"\n[10] Wrote collocates -> {output_file.relative_to(ROOT)}")
 
 
@@ -501,7 +727,9 @@ def generate_kwic_html(rows):
         ("log_likelihood", "Log-likelihood"),
         ("log_dice", "logDice"),
         ("p_value", "p-value"),
+        ("log10_p_value", "log10(p-value)"),
         ("adjusted_p_value", "Adjusted p-value"),
+        ("log10_adjusted_p_value", "log10(adjusted p-value)"),
     )
     run_by_horizon = {
         "5": "window_h5",
@@ -567,10 +795,13 @@ def generate_kwic_html(rows):
         "phase", "year", "method", "horizon", "collocate", "match_number",
         "corpus_line", "juan", "title", "left", "node", "right", "context",
         "target", "exp_local", "obs_local", "ratio_local", "obs_global",
-        "p_value", "log_likelihood", "log_dice", "adjusted_p_value",
+        "p_value", "log10_p_value", "log_likelihood", "log_dice",
+        "adjusted_p_value", "log10_adjusted_p_value",
     ]
     with KWIC_CSV_FILE.open("w", encoding="utf-8-sig", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=kwic_fields)
+        writer = csv.DictWriter(
+            csv_file, fieldnames=kwic_fields, lineterminator="\n"
+        )
         writer.writeheader()
         for phase_name, _, _ in MING_PHASES:
             for horizon_name, _ in horizons:
@@ -600,9 +831,9 @@ def generate_kwic_html(rows):
                                 for field in kwic_fields
                                 if field in {
                                     "exp_local", "obs_local", "ratio_local",
-                                    "obs_global", "p_value",
+                                    "obs_global", "p_value", "log10_p_value",
                                     "log_likelihood", "log_dice",
-                                    "adjusted_p_value",
+                                    "adjusted_p_value", "log10_adjusted_p_value",
                                 }
                             },
                         })
@@ -644,15 +875,29 @@ def generate_kwic_html(rows):
                             stat_items = []
                             for field, label in statistic_fields:
                                 raw_value = passage["stats"].get(field, "")
-                                try:
-                                    number = float(raw_value)
-                                    value = (
-                                        f"{number:.3g}"
-                                        if field in {"p_value", "adjusted_p_value"}
-                                        else f"{number:,.4g}"
-                                    )
-                                except (TypeError, ValueError):
+                                log_field = {
+                                    "p_value": "log10_p_value",
+                                    "adjusted_p_value": "log10_adjusted_p_value",
+                                }.get(field)
+                                if field in {"p_value", "adjusted_p_value"}:
                                     value = raw_value or "—"
+                                elif log_field and passage["stats"].get(log_field):
+                                    value = _format_probability(
+                                        float(passage["stats"][log_field])
+                                    )
+                                else:
+                                    try:
+                                        number = float(raw_value)
+                                        value = (
+                                            f"{number:.3g}"
+                                            if field in {
+                                                "p_value",
+                                                "adjusted_p_value",
+                                            }
+                                            else f"{number:,.4g}"
+                                        )
+                                    except (TypeError, ValueError):
+                                        value = raw_value or "—"
                                 stat_items.append(
                                     f'<span><strong>{html.escape(label)}:</strong> '
                                     f"{html.escape(value)}</span>"
@@ -745,6 +990,7 @@ mark.node {{ background: #b9e4dc; font-weight: 800; }}
 <h1>{html.escape(title)}</h1>
 <p>Concordance passages for 倭 and the supplied collocates in the Early, Middle, and Late Ming phases.</p>
 <p class="intro">Use the navigation bar to open a period. Each collocate is shown with 5-Word Analysis, 10-Word Analysis, and Sentence Analysis contexts.</p>
+<p class="intro"><strong>Statistics note:</strong> earlier output contained 11 raw p-values recorded as 0.0 by the previous test backend, although recomputation gives finite nonzero probabilities. Fisher p-values below are recomputed as high-precision decimal tails and shown as fixed decimals to 50 significant digits; log10 values are provided for readability and sorting.</p>
 </section>
 {''.join(phase_pages)}
 </main>
@@ -823,19 +1069,34 @@ def render_sortable_table(rows, columns, numeric_columns=()):
             value = row.get(column, "")
             raw_value = str(value)
             display_value = raw_value
+            sort_value = raw_value
             if column in numeric_columns and raw_value:
                 try:
-                    number = float(raw_value)
                     if column in {"p_value", "adjusted_p_value"}:
-                        display_value = f"{number:.3g}"
+                        log_column = (
+                            "log10_p_value"
+                            if column == "p_value"
+                            else "log10_adjusted_p_value"
+                        )
+                        log_value = row.get(log_column, "")
+                        if log_value:
+                            display_value = raw_value
+                            sort_value = str(log_value)
+                        else:
+                            display_value = raw_value
+                    elif column in {
+                        "log10_p_value",
+                        "log10_adjusted_p_value",
+                    }:
+                        display_value = f"{float(raw_value):.4f}"
                     elif column in {"log_likelihood", "log_dice"}:
-                        display_value = f"{number:.3f}"
+                        display_value = f"{float(raw_value):.3f}"
                     elif column in {"exp_local", "ratio_local"}:
-                        display_value = f"{number:.4g}"
+                        display_value = f"{float(raw_value):.4g}"
                 except ValueError:
                     display_value = raw_value
             cells.append(
-                f"<td data-value=\"{html.escape(raw_value, quote=True)}\" "
+                f"<td data-value=\"{html.escape(sort_value, quote=True)}\" "
                 f"title=\"{html.escape(raw_value, quote=True)}\">"
                 f"{html.escape(display_value)}</td>"
             )
@@ -880,18 +1141,27 @@ def generate_results_html():
         ("phase", "Phase"),
         ("target", "Target"),
         ("collocate", "Collocate"),
+        ("a_target_and_collocate", "a: target + collocate"),
+        ("b_target_without_collocate", "b: target, not collocate"),
+        ("c_collocate_without_target", "c: collocate, not target"),
+        ("d_neither", "d: neither"),
         ("exp_local", "Expected"),
         ("obs_local", "Observed"),
         ("ratio_local", "Observed / expected"),
+        ("log_likelihood", "Log-likelihood (G²)"),
+        ("log_dice", "logDice"),
         ("obs_global", "Global frequency"),
         ("p_value", "p-value"),
+        ("log10_p_value", "log10(p)"),
         ("adjusted_p_value", "Adjusted p-value"),
-        ("log_likelihood", "Log-likelihood"),
-        ("log_dice", "logDice"),
+        ("log10_adjusted_p_value", "log10(adjusted p)"),
     ]
     numeric_collocation_columns = {
+        "a_target_and_collocate", "b_target_without_collocate",
+        "c_collocate_without_target", "d_neither",
         "exp_local", "obs_local", "ratio_local", "obs_global",
-        "p_value", "adjusted_p_value", "log_likelihood", "log_dice",
+        "p_value", "log10_p_value", "adjusted_p_value",
+        "log10_adjusted_p_value", "log_likelihood", "log_dice",
     }
     pages = []
     comparison_data = {}
@@ -910,13 +1180,15 @@ def generate_results_html():
             comparison_row = comparison_data.setdefault(collocate, {}).setdefault(
                 phase, {}
             )
-            comparison_row[run_key] = {
+            method_statistics = {
                 key: record.get(key, "")
                 for key in (
                     "log_dice", "log_likelihood", "obs_local", "exp_local",
-                    "ratio_local", "obs_global", "p_value", "adjusted_p_value",
+                    "ratio_local", "obs_global", "p_value", "log10_p_value",
+                    "adjusted_p_value", "log10_adjusted_p_value",
                 )
             }
+            comparison_row[run_key] = method_statistics
         phase_tables = []
         for phase in phases:
             phase_rows = [record for record in records if record["phase"] == phase]
@@ -929,7 +1201,12 @@ def generate_results_html():
             f'<section class="page" id="page-{page_id}" hidden>'
             f"<h2>{html.escape(page_title)}</h2>"
             f'<p class="method-note">{html.escape(method_label)} · '
-            "Benjamini–Hochberg adjusted p-value and raw p-value shown. "
+            "Contingency table cells: a = target and collocate, b = target without "
+            "collocate, c = collocate without target, d = neither. "
+            "Log-likelihood and logDice are reported with the counts. "
+            "P-values use a stable Fisher exact upper-tail calculation and are "
+            "expanded as fixed decimals to 50 significant digits; "
+            "log10 columns allow sorting across very small values. "
             "Click any column heading to sort.</p>"
             f"{''.join(phase_tables)}</section>"
         )
@@ -1019,6 +1296,13 @@ def generate_results_html():
         f"<h1>{html.escape(title)}</h1>"
         '<p class="cover-copy">Collocates of 倭 and related target-word frequencies '
         "across three Ming-period phases.</p>"
+        '<p class="method-note"><strong>Numerical note:</strong> earlier output '
+        "contained 11 raw p-values recorded as 0.0. Recomputing the one-sided "
+        "Fisher exact upper tail gives finite nonzero values (for example, "
+        "2.37985e-18 for 海上 in the 5-token analysis). These probabilities are "
+        "representable as floating-point values; the zeroes came from the previous "
+        "test backend’s calculation, not from a probability of exactly zero. This "
+        "report uses log-space tails and shows scientific notation with log10(p).</p>"
         '<p class="cover-phases">Early Ming (1368–1522) · Middle Ming (1523–1567) · '
         "Late Ming (1568–1644)</p>"
         '<p class="cover-hint">Use the navigation bar above to open each analysis page.</p>'
@@ -1142,21 +1426,21 @@ const comparisonData = {comparison_json};
 
   function formatStat(value, statistic) {{
     if (value === undefined || value === '') return '—';
+    if (statistic === 'p_value' || statistic === 'adjusted_p_value') {{
+      return String(value);
+    }}
     const number = Number(value);
     if (!Number.isFinite(number)) return '—';
-    if (statistic === 'p_value' || statistic === 'adjusted_p_value') {{
-      return number === 0 ? '0' : number.toExponential(3);
-    }}
     if (statistic === 'obs_local' || statistic === 'obs_global') {{
       return number.toLocaleString();
     }}
     return number.toFixed(3);
   }}
 
-  function addCell(row, value) {{
+  function addCell(row, value, sortValue = value) {{
     const cell = row.insertCell();
     cell.textContent = value;
-    cell.dataset.value = value;
+    cell.dataset.value = sortValue;
   }}
 
   function renderComparison() {{
@@ -1177,12 +1461,18 @@ const comparisonData = {comparison_json};
       addCell(row, item.collocate);
       for (const phase of {json.dumps(phases, ensure_ascii=False)}) {{
         const rawValue = item.phases[phase]?.[method]?.[statistic];
+        const logKey = statistic === 'p_value'
+          ? 'log10_p_value'
+          : statistic === 'adjusted_p_value'
+            ? 'log10_adjusted_p_value'
+            : '';
+        const logValue = logKey ? item.phases[phase]?.[method]?.[logKey] : '';
         const displayValue = formatStat(rawValue, statistic);
         const cell = row.insertCell();
         cell.textContent = displayValue;
         cell.dataset.value = rawValue === undefined || rawValue === ''
           ? ''
-          : String(Number(rawValue));
+          : (logValue === '' ? String(Number(rawValue)) : String(Number(logValue)));
         cell.title = rawValue === undefined || rawValue === ''
           ? 'Not present in the selected method’s significant top-20 results for this phase'
           : `${{statisticNames[statistic]}}: ${{rawValue}}`;

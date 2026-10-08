@@ -26,6 +26,34 @@ Sample Prompts:
 
 ## Record of AI Use (2026-10-08)
 
+Follow-up analysis:
+1. Re-evaluated the collocate tables and found 11 exported raw p-values stored as
+   `0.0` by the original exact-test backend. Their recomputed Fisher upper-tail
+   probabilities were nonzero and representable as floating-point values; the
+   smallest log10(p) across the 180 exported rows was -31.410.
+2. Updated `analysis.py` to rebuild method-specific contingency tables, compute
+   one-sided Fisher exact upper-tail probabilities in log space, and perform
+   Benjamini–Hochberg correction in log10 space before applying the significance
+   threshold. The initial follow-up export used scientific notation with log10
+   columns; see item 4 for the later fixed-decimal display update.
+3. Updated `output/results.html` to explain the prior backend zeroes and both
+   HTML reports to show recomputed p-values and log10 values. Adjusted significance
+   now uses the recomputed p-values. The precise internal cause of the backend’s
+   erroneous zero values was not established.
+4. Added the four contingency-table cells (target and collocate, target only,
+   collocate only, neither) and prominent Log-likelihood (G²) and logDice columns
+   to the collocation CSV and HTML results. Recomputed raw Fisher p-values as
+   high-precision decimal tails and expanded them to fixed decimal form with 50
+   significant digits. Raw and adjusted p-values are carried through to the HTML
+   reports without converting them back through floating point; adjusted values
+   are expanded from the log-space Benjamini–Hochberg calculation. The log10
+   values remain available for inspection and sorting.
+
+Human verification:
+- Check the concordance contexts and historical meaning of significant collocates.
+  A small p-value indicates association under the selected model, not historical
+  causation or direct semantic equivalence.
+
 What the AI did:
 1. Updated the analysis periods to Early Ming (1368–1522), Middle Ming (1523–1567), and Late Ming (1568–1644), with no overlapping boundary year.
 2. Extended era-year conversion through the end of the Ming dynasty by adding 泰昌, 天启, and 崇祯 era starts.
